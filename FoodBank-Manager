@@ -1,0 +1,474 @@
+/*
+ * Food Bank Donation & Distribution Management System
+ * ---------------------------------------------------
+ * Concepts used: structures, dynamic memory (malloc/realloc/free),
+ * 2D arrays, pointers, sorting (by expiry), decision making, functions.
+ *
+ * Compile : gcc food_bank.c -o food_bank
+ * Run     : ./food_bank        (Windows: food_bank.exe)
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define MAX_LOC   3          /* number of shelters / locations      */
+#define NAME_LEN  40
+#define SOON_DAYS 3          /* "expiring soon" alert window (days) */
+
+static const char *LOC_NAMES[MAX_LOC] = {"Shelter A", "Shelter B", "Shelter C"};
+
+/* ---------------------------- STRUCTURES ---------------------------- */
+typedef struct { int d, m, y; } Date;
+
+typedef struct {                 /* one donated batch of food          */
+    int  id;
+    char item[NAME_LEN];
+    int  perishable;             /* 1 = perishable, 0 = non-perishable */
+    int  veg;                    /* 1 = vegetarian, 0 = non-veg        */
+    int  qty;                    /* quantity still in stock            */
+    int  original;               /* quantity originally donated        */
+    int  distributed;            /* total given out so far             */
+    int  wasted;                 /* quantity lost to expiry            */
+    Date expiry;
+    char donor[NAME_LEN];
+    char phone[15];
+    int  location;               /* 0 .. MAX_LOC-1                     */
+} Donation;
+
+typedef struct {                 /* one recipient request              */
+    int  id;
+    char name[NAME_LEN];
+    int  familySize;
+    int  vegOnly;                /* dietary restriction: 1 = veg only  */
+    int  priority;               /* 1 = low, 2 = medium, 3 = high      */
+    char item[NAME_LEN];
+    int  needQty;
+    int  received;
+    int  location;
+} Request;
+
+typedef struct {                 /* one line of the distribution log   */
+    int  batchNo;
+    Date date;
+    int  reqId;
+    int  donationId;
+    char item[NAME_LEN];
+    int  qty;
+    int  location;
+    int  perishable;
+} DistRecord;
+
+/* ------------------- DYNAMIC ARRAYS (grow with realloc) ------------- */
+Donation   *donations = NULL; int donCount = 0, donCap = 0;
+Request    *requests  = NULL; int reqCount = 0, reqCap = 0;
+DistRecord *dist      = NULL; int distCount = 0, distCap = 0;
+
+Date today = {1, 1, 2026};
+int  nextDonId = 1, nextReqId = 1, batchNo = 0;
+
+/* ------------------------------ HELPERS ----------------------------- */
+long dateToDays(Date x)          /* convert date to a day number */
+{
+    int a = (14 - x.m) / 12;
+    int y = x.y + 4800 - a;
+    int m = x.m + 12 * a - 3;
+    return x.d + (153 * m + 2) / 5 + 365L * y + y / 4 - y / 100 + y / 400 - 32045;
+}
+
+int daysInMonth(int m, int y)
+{
+    int dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) return 29;
+    return dm[m - 1];
+}
+
+void nextDay(Date *d)            /* pointer: modifies the original date */
+{
+    d->d++;
+    if (d->d > daysInMonth(d->m, d->y)) { d->d = 1; d->m++; }
+    if (d->m > 12) { d->m = 1; d->y++; }
+}
+
+void printDate(Date d) { printf("%02d-%02d-%04d", d.d, d.m, d.y); }
+
+int sameItem(const char *a, const char *b)   /* case-insensitive compare */
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+int isExpired(const Donation *d) { return dateToDays(d->expiry) < dateToDays(today); }
+
+void readLine(const char *prompt, char *buf, int size)
+{
+    printf("%s", prompt);
+    scanf(" %[^\n]", buf);
+    buf[size - 1] = '\0';
+}
+
+int readInt(const char *prompt, int lo, int hi)  /* validated integer input */
+{
+    int v;
+    while (1) {
+        printf("%s", prompt);
+        if (scanf("%d", &v) != 1) {
+            while (getchar() != '\n');
+            printf("  Please enter a number.\n");
+            continue;
+        }
+        if (v >= lo && v <= hi) return v;
+        printf("  Value must be between %d and %d.\n", lo, hi);
+    }
+}
+
+Date readDate(const char *prompt)
+{
+    Date d;
+    while (1) {
+        printf("%s (DD MM YYYY): ", prompt);
+        if (scanf("%d %d %d", &d.d, &d.m, &d.y) == 3 &&
+            d.m >= 1 && d.m <= 12 && d.y >= 2000 &&
+            d.d >= 1 && d.d <= daysInMonth(d.m, d.y))
+            return d;
+        while (getchar() != '\n');
+        printf("  Invalid date, try again.\n");
+    }
+}
+
+/* grow arrays when full */
+void ensureDonCap(void)
+{
+    if (donCount == donCap) {
+        donCap = donCap ? donCap * 2 : 4;
+        donations = realloc(donations, donCap * sizeof(Donation));
+        if (!donations) { printf("Out of memory!\n"); exit(1); }
+    }
+}
+void ensureReqCap(void)
+{
+    if (reqCount == reqCap) {
+        reqCap = reqCap ? reqCap * 2 : 4;
+        requests = realloc(requests, reqCap * sizeof(Request));
+        if (!requests) { printf("Out of memory!\n"); exit(1); }
+    }
+}
+void ensureDistCap(void)
+{
+    if (distCount == distCap) {
+        distCap = distCap ? distCap * 2 : 8;
+        dist = realloc(dist, distCap * sizeof(DistRecord));
+        if (!dist) { printf("Out of memory!\n"); exit(1); }
+    }
+}
+
+void listLocations(void)
+{
+    int i;
+    for (i = 0; i < MAX_LOC; i++) printf("  %d. %s\n", i + 1, LOC_NAMES[i]);
+}
+
+/* ------------------------------ INGESTION --------------------------- */
+void addDonationData(const char *item, int perishable, int veg, int qty,
+                     Date exp, const char *donor, const char *phone, int loc)
+{
+    ensureDonCap();
+    Donation *d = &donations[donCount++];
+    d->id = nextDonId++;
+    strncpy(d->item, item, NAME_LEN - 1);   d->item[NAME_LEN - 1] = '\0';
+    strncpy(d->donor, donor, NAME_LEN - 1); d->donor[NAME_LEN - 1] = '\0';
+    strncpy(d->phone, phone, 14);           d->phone[14] = '\0';
+    d->perishable = perishable; d->veg = veg;
+    d->qty = d->original = qty;
+    d->distributed = d->wasted = 0;
+    d->expiry = exp; d->location = loc;
+}
+
+void addDonation(void)
+{
+    char item[NAME_LEN], donor[NAME_LEN], phone[15];
+    readLine("Item name (e.g. Rice): ", item, NAME_LEN);
+    int perishable = readInt("Perishable? (1 = Yes, 0 = No): ", 0, 1);
+    int veg        = readInt("Vegetarian? (1 = Yes, 0 = No): ", 0, 1);
+    int qty        = readInt("Quantity (units): ", 1, 100000);
+    Date exp       = readDate("Expiry date");
+    readLine("Donor name: ", donor, NAME_LEN);
+    readLine("Donor phone: ", phone, 15);
+    listLocations();
+    int loc = readInt("Store at location: ", 1, MAX_LOC) - 1;
+    addDonationData(item, perishable, veg, qty, exp, donor, phone, loc);
+    printf("Donation recorded (ID %d).\n", nextDonId - 1);
+}
+
+void addRequestData(const char *name, int fam, int vegOnly, int pr,
+                    const char *item, int need, int loc)
+{
+    ensureReqCap();
+    Request *r = &requests[reqCount++];
+    r->id = nextReqId++;
+    strncpy(r->name, name, NAME_LEN - 1); r->name[NAME_LEN - 1] = '\0';
+    strncpy(r->item, item, NAME_LEN - 1); r->item[NAME_LEN - 1] = '\0';
+    r->familySize = fam; r->vegOnly = vegOnly; r->priority = pr;
+    r->needQty = need; r->received = 0; r->location = loc;
+}
+
+void addRequest(void)
+{
+    char name[NAME_LEN], item[NAME_LEN];
+    readLine("Recipient / family name: ", name, NAME_LEN);
+    int fam  = readInt("Family size: ", 1, 100);
+    int veg  = readInt("Vegetarian only? (1 = Yes, 0 = No): ", 0, 1);
+    int pr   = readInt("Priority (1 = Low, 2 = Medium, 3 = High): ", 1, 3);
+    readLine("Item needed: ", item, NAME_LEN);
+    int need = readInt("Quantity needed: ", 1, 100000);
+    listLocations();
+    int loc  = readInt("Nearest location: ", 1, MAX_LOC) - 1;
+    addRequestData(name, fam, veg, pr, item, need, loc);
+    printf("Request recorded (ID %d).\n", nextReqId - 1);
+}
+
+/* ------------------------------ SORTING ----------------------------- */
+void sortDonationsByExpiry(void)           /* insertion sort: earliest first */
+{
+    int i, j;
+    for (i = 1; i < donCount; i++) {
+        Donation key = donations[i];
+        j = i - 1;
+        while (j >= 0 && dateToDays(donations[j].expiry) > dateToDays(key.expiry)) {
+            donations[j + 1] = donations[j];
+            j--;
+        }
+        donations[j + 1] = key;
+    }
+}
+
+/* ------------------------- EXPIRY CHECK / ALERTS -------------------- */
+void checkExpiry(int verbose)
+{
+    int i, found = 0;
+    for (i = 0; i < donCount; i++) {
+        Donation *d = &donations[i];
+        if (d->qty == 0) continue;
+        if (isExpired(d)) {
+            if (verbose) printf("  [EXPIRED] %s (batch %d) - %d units written off\n",
+                                d->item, d->id, d->qty);
+            d->wasted += d->qty;
+            d->qty = 0;
+            found = 1;
+        } else if (dateToDays(d->expiry) - dateToDays(today) <= SOON_DAYS) {
+            if (verbose) {
+                printf("  [EXPIRING SOON] %s (batch %d) - %d units, expires ",
+                       d->item, d->id, d->qty);
+                printDate(d->expiry);
+                printf(" at %s\n", LOC_NAMES[d->location]);
+            }
+            found = 1;
+        }
+    }
+    if (verbose && !found) printf("  No expiry alerts.\n");
+}
+
+void expiryAlerts(void)
+{
+    printf("\n--- Expiry Alerts (today: ");
+    printDate(today);
+    printf(") ---\n");
+    checkExpiry(1);
+}
+
+/* ------------------------------ INVENTORY --------------------------- */
+void showInventory(void)
+{
+    int stock[MAX_LOC][2] = {{0}};          /* 2D array: [location][0=perishable,1=non-perishable] */
+    int i, l;
+
+    sortDonationsByExpiry();
+    printf("\n--- Inventory (sorted by expiry) ---\n");
+    printf("%-4s %-14s %-6s %-5s %-6s %-12s %-10s\n",
+           "ID", "Item", "Type", "Veg", "Qty", "Expiry", "Location");
+    for (i = 0; i < donCount; i++) {
+        Donation *d = &donations[i];
+        if (d->qty == 0) continue;
+        printf("%-4d %-14s %-6s %-5s %-6d ", d->id, d->item,
+               d->perishable ? "Peri" : "Non", d->veg ? "Yes" : "No", d->qty);
+        printDate(d->expiry);
+        printf("   %s\n", LOC_NAMES[d->location]);
+        stock[d->location][d->perishable ? 0 : 1] += d->qty;
+    }
+    printf("\nStock summary (units):\n%-12s %-12s %-14s\n", "Location", "Perishable", "Non-perishable");
+    for (l = 0; l < MAX_LOC; l++)
+        printf("%-12s %-12d %-14d\n", LOC_NAMES[l], stock[l][0], stock[l][1]);
+}
+
+/* ------------------- MATCHING & DISTRIBUTION BATCH ------------------ */
+void runMatching(void)
+{
+    int i, j, k;
+    int *order;                      /* request indices sorted by need  */
+    int total = 0;
+
+    if (reqCount == 0 || donCount == 0) { printf("Need both donations and requests.\n"); return; }
+
+    checkExpiry(0);                  /* write off expired stock first   */
+    sortDonationsByExpiry();         /* FIFO: earliest expiry first     */
+
+    order = malloc(reqCount * sizeof(int));
+    if (!order) { printf("Out of memory!\n"); return; }
+    for (i = 0; i < reqCount; i++) order[i] = i;
+
+    /* selection sort: highest priority first, then bigger family */
+    for (i = 0; i < reqCount - 1; i++) {
+        int best = i;
+        for (j = i + 1; j < reqCount; j++) {
+            Request *a = &requests[order[j]], *b = &requests[order[best]];
+            if (a->priority > b->priority ||
+               (a->priority == b->priority && a->familySize > b->familySize))
+                best = j;
+        }
+        int t = order[i]; order[i] = order[best]; order[best] = t;
+    }
+
+    batchNo++;
+    printf("\n=== Distribution Batch #%d (", batchNo);
+    printDate(today);
+    printf(") ===\n");
+
+    for (i = 0; i < reqCount; i++) {
+        Request *r = &requests[order[i]];
+        int remaining = r->needQty - r->received;
+        for (k = 0; k < donCount && remaining > 0; k++) {
+            Donation *d = &donations[k];
+            if (d->qty == 0 || isExpired(d))      continue;
+            if (d->location != r->location)       continue;
+            if (!sameItem(d->item, r->item))      continue;
+            if (r->vegOnly && !d->veg)            continue;   /* dietary rule */
+
+            int give = (d->qty < remaining) ? d->qty : remaining;
+            d->qty -= give; d->distributed += give;
+            r->received += give; remaining -= give; total += give;
+
+            ensureDistCap();
+            DistRecord *x = &dist[distCount++];
+            x->batchNo = batchNo; x->date = today;
+            x->reqId = r->id; x->donationId = d->id;
+            strcpy(x->item, d->item);
+            x->qty = give; x->location = d->location; x->perishable = d->perishable;
+
+            printf("  %-12s <- %4d x %-12s (batch %d, expires ", r->name, give, d->item, d->id);
+            printDate(d->expiry);
+            printf(", %s)\n", LOC_NAMES[d->location]);
+        }
+        if (remaining > 0)
+            printf("  %-12s still needs %d x %s (stock unavailable)\n", r->name, remaining, r->item);
+    }
+    printf("Total distributed in this batch: %d units\n", total);
+    free(order);                     /* release dynamic memory */
+}
+
+/* ------------------------------ REPORTS ----------------------------- */
+void dailyReport(void)
+{
+    int perLoc[MAX_LOC][2] = {{0}};  /* 2D array: per location, perishable/non */
+    int i, l, total = 0;
+
+    printf("\n--- Daily Distribution Report: ");
+    printDate(today);
+    printf(" ---\n");
+    for (i = 0; i < distCount; i++) {
+        if (dateToDays(dist[i].date) != dateToDays(today)) continue;
+        printf("  Batch %d | Request %d | %-12s | %4d units | %s\n",
+               dist[i].batchNo, dist[i].reqId, dist[i].item, dist[i].qty,
+               LOC_NAMES[dist[i].location]);
+        perLoc[dist[i].location][dist[i].perishable ? 0 : 1] += dist[i].qty;
+        total += dist[i].qty;
+    }
+    if (total == 0) { printf("  Nothing distributed today.\n"); return; }
+    printf("\n%-12s %-12s %-14s\n", "Location", "Perishable", "Non-perishable");
+    for (l = 0; l < MAX_LOC; l++)
+        printf("%-12s %-12d %-14d\n", LOC_NAMES[l], perLoc[l][0], perLoc[l][1]);
+    printf("Total distributed today: %d units\n", total);
+}
+
+void wasteReport(void)
+{
+    int i, total = 0;
+    checkExpiry(0);
+    printf("\n--- Waste Due to Expiry ---\n");
+    for (i = 0; i < donCount; i++)
+        if (donations[i].wasted > 0) {
+            printf("  Batch %d: %-12s %4d units wasted (expired ", donations[i].id,
+                   donations[i].item, donations[i].wasted);
+            printDate(donations[i].expiry);
+            printf(")\n");
+            total += donations[i].wasted;
+        }
+    if (total == 0) printf("  No waste recorded.\n");
+    else printf("Total wasted: %d units\n", total);
+}
+
+void donorAcknowledgements(void)
+{
+    int i;
+    printf("\n--- Donor Acknowledgements ---\n");
+    if (donCount == 0) { printf("  No donations yet.\n"); return; }
+    for (i = 0; i < donCount; i++) {
+        Donation *d = &donations[i];
+        printf("Dear %s (%s),\n", d->donor, d->phone);
+        printf("  Thank you for donating %d x %s. So far %d units have reached families in need",
+               d->original, d->item, d->distributed);
+        if (d->wasted > 0) printf(" (%d units expired before use)", d->wasted);
+        printf(".\n\n");
+    }
+}
+
+/* ------------------------------ SAMPLE DATA ------------------------- */
+void loadSample(void)
+{
+    Date a = {22, 11, 2026}, b = {20, 11, 2026}, c = {30, 6, 2027}, e = {25, 11, 2026};
+    addDonationData("Rice",   0, 1, 100, c, "Ravi Sharma",  "9876500001", 0);
+    addDonationData("Bread",  1, 1,  40, b, "City Bakery",  "9876500002", 0);
+    addDonationData("Milk",   1, 1,  30, a, "Anita Verma",  "9876500003", 0);
+    addDonationData("Chicken",1, 0,  20, e, "Hotel Grand",  "9876500004", 1);
+    addDonationData("Rice",   0, 1,  50, c, "Mohan Das",    "9876500005", 1);
+    addRequestData("Singh Family", 6, 1, 3, "Rice",  30, 0);
+    addRequestData("Khan Family",  4, 0, 2, "Bread", 25, 0);
+    addRequestData("Gupta Family", 3, 1, 1, "Bread", 25, 0);
+    addRequestData("Das Family",   5, 0, 3, "Chicken", 10, 1);
+    printf("Sample data loaded (set today's date to 19 11 2026 for the demo).\n");
+}
+
+/* -------------------------------- MAIN ------------------------------ */
+int main(void)
+{
+    int choice;
+    printf("=== Food Bank Donation & Distribution Management ===\n");
+    today = readDate("Enter today's date");
+
+    do {
+        printf("\n1. Add donation\n2. Add recipient request\n3. Show inventory\n"
+               "4. Expiry alerts\n5. Run matching & create distribution batch\n"
+               "6. Daily distribution report\n7. Waste report\n"
+               "8. Donor acknowledgements\n9. Advance to next day\n"
+               "10. Load sample data\n0. Exit\n");
+        choice = readInt("Choice: ", 0, 10);
+        switch (choice) {
+            case 1:  addDonation();            break;
+            case 2:  addRequest();             break;
+            case 3:  showInventory();          break;
+            case 4:  expiryAlerts();           break;
+            case 5:  runMatching();            break;
+            case 6:  dailyReport();            break;
+            case 7:  wasteReport();            break;
+            case 8:  donorAcknowledgements();  break;
+            case 9:  nextDay(&today); printf("Today is now "); printDate(today); printf("\n"); break;
+            case 10: loadSample();             break;
+            case 0:  printf("Goodbye!\n");     break;
+        }
+    } while (choice != 0);
+
+    free(donations); free(requests); free(dist);   /* free all dynamic memory */
+    return 0;
+}
